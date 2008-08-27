@@ -2,11 +2,13 @@ package DBIx::Class::GeomColumns;
 use strict;
 use warnings;
 use Carp;
+use Geo::Converter::WKT2KML;
 
-use version; our $VERSION = qv('0.0.1');
+use version; our $VERSION = qv('0.0.2');
 use base qw/DBIx::Class/;
 
 __PACKAGE__->mk_classdata( '_geom_columns' );
+__PACKAGE__->mk_classdata( '_kml_columns' );
 
 =head1 NAME
 
@@ -17,8 +19,9 @@ DBIx::Class::GeomColumns - Filter of geometry columns to access with WKT
     package POI;
     __PACKAGE__->load_components(qw/GeomColumns Core/);
     __PACKAGE__->utf8_columns('wgs84_col',{'tokyo_col' => 4301});
+    __PACKAGE__->kml_columns('kml_col');
     
-    # then belows return the result of 'AsText(wgs84_col)'
+    # Then belows return the result of 'AsText(wgs84_col)'
     $poi->wgs84_col;
 
     # You can also create or update 'GeomFromText($data,$srid)';
@@ -26,13 +29,14 @@ DBIx::Class::GeomColumns - Filter of geometry columns to access with WKT
     $poi->tokyo_col('POINT(135 35)');
     $poi->update;
 
+    # Access by KML geometry fragment 
+    $poi->kml_col; 
+    $poi->kml_col('<LineString><coordinates>135,35 136,36</coordinates></LineString>');
+    $poi->update;
+
 =head1 DESCRIPTION
 
-This module allows you to access geometry columns by WKT format.
-
-=head1 SEE ALSO
-
-L<Template::Stash::UTF8Columns>.
+This module allows you to access geometry columns by WKT or KML format.
 
 =head1 METHODS
 
@@ -40,8 +44,25 @@ L<Template::Stash::UTF8Columns>.
 
 =cut
 
-sub geom_columns {
-    my $self = shift;
+sub geom_columns { shift->set_geom_columns( 'geom', @_ ) }
+
+=head2 kml_columns
+
+=cut
+
+sub kml_columns  { shift->set_geom_columns( 'kml',  @_ ) }
+
+=head1 INTERNAL METHODS
+
+=head2 set_geom_column
+
+=cut
+
+sub set_geom_columns {
+    my $self    = shift;
+    my $type    = shift;
+    my $property = "_${type}_columns"; 
+
     if (@_) {
         my %args;
         foreach my $elm (@_) {
@@ -61,13 +82,63 @@ sub geom_columns {
             }
         );
 
-        return $self->_geom_columns({ map { $_ => $args{$_} } @keys });
+        return $self->$property({ map { $_ => $args{$_} } @keys });
     } else {
-        return $self->_geom_columns;
+        return $self->$property;
     }
 }
 
-=head1 EXTENDED METHODS
+=head2 get_column
+
+=cut
+
+sub get_column {
+    my ( $self, $column ) = @_;
+    my $value = $self->next::method($column);
+
+    my $kcols = $self->_kml_columns || {};
+    my $cols  = { %{ $self->_geom_columns || {} }, %{ $kcols } };
+
+    if ( $cols and defined $value and ref($value) and ref($value) eq 'SCALAR' and $cols->{$column} ) {
+        $value = ${$value} . "";
+        $value =~ s/GeomFromText\('(.+)',\d+\)/$1/;
+    }
+
+    if ( $kcols and defined $value and $kcols->{$column} ) {
+        $value = wkt2kml($value);
+    }
+
+    $value;
+}
+
+=head2 get_columns
+
+=cut
+
+sub get_columns {
+    my $self = shift;
+    my %data = $self->next::method(@_);
+
+    my $kcols = $self->_kml_columns || {};
+    my $cols  = { %{ $self->_geom_columns || {} }, %{ $kcols } };
+
+    unless ( (caller(1))[3] eq 'DBIx::Class::Row::insert' ) {
+        foreach my $col (grep { defined $data{$_} } keys %{ $cols }) {
+            my $value = $data{$col};
+
+            if ( ref($value) and ref($value) eq 'SCALAR' ) {
+                $value = ${$value};
+                $value =~ s/GeomFromText\('(.+)',\d+\)/$1/;
+            }
+
+            $value = wkt2kml($value) if ( $kcols->{$col} );
+
+            $data{$col} = $value;
+        }
+    }
+
+    %data;
+}
 
 =head2 store_column
 
@@ -76,13 +147,25 @@ sub geom_columns {
 sub store_column {
     my ( $self, $column, $value ) = @_;
 
-    my $cols = $self->_geom_columns;
-    if ( $cols and defined $value and my $srid = $cols->{$column} ) {
-        $value = \"GeomFromText('$value',$srid)";
+    my $kcols = $self->_kml_columns || {};
+    my $cols  = { %{ $self->_geom_columns || {} }, %{ $kcols } };
+
+    if ( $cols and defined $value ) {
+        $value = kml2wkt($value) if ( $kcols->{$column} );
+
+        if ( my $srid = $cols->{$column} ) {
+            $value = \"GeomFromText('$value',$srid)";
+        }
     }
 
     $self->next::method( $column, $value );
 }
+
+=head1 DEPENDENCIES
+
+L<Geo::Converter::WKT2KML>.
+
+L<DBIx::Class>.
 
 =head1 AUTHOR
 
